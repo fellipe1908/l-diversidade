@@ -1,0 +1,647 @@
+
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import calendar
+import pandas as pd
+import os
+import json
+from sklearn.preprocessing import MinMaxScaler
+
+class Anonymizer():
+
+    def __init__(self, dataframe: pd.DataFrame):
+
+        #copia do dataframe
+        self.df = dataframe.copy()
+
+        # 'self.df_anon' é uma variável de instância que guardará o DataFrame
+        self.df_anon = None
+
+    # Método para preparar os dados
+    def preprocess_data(self, sample_frac=0.01):
+        #Faz a seleção de colunas
+        columns_of_interest = ['idadeCaso', 'dataNascimento', 'racaCor']
+
+        #Seleciona as colunas de interesse e faz uma cópia para não alterar o DataFrame original
+        temp_df = self.df[columns_of_interest].copy()
+
+        # Converte a coluna 'idadeCaso' para um formato numérico e se não conseguir converter coloca 'NaN'
+        temp_df['idadeCaso'] = pd.to_numeric(temp_df['idadeCaso'], errors='coerce')
+
+        # Converte a coluna 'dataNascimento' para o formato de data e hora e se não conseguir converter coloca 'NaN'
+        temp_df['dataNascimento'] = pd.to_datetime(temp_df['dataNascimento'], errors='coerce')
+
+        # Ela remove as linhas que se tornaram 'NaN'
+        temp_df = temp_df.dropna()
+
+        #Verifica se a pessoa digitou que queria todo o dataset ou apenas uma fração dele
+        if sample_frac < 1.0:
+            print(f"Reduzindo dataset de {len(temp_df)} para {sample_frac*100}%...")
+            #Pega uma fração aleatoria das linhas
+            self.df_anon = temp_df.sample(frac=sample_frac, random_state=42)
+
+        #Caso tiver digitado 1 é por que quer o dataset completo logo vem para o else
+        else:
+            self.df_anon = temp_df
+
+        #Após usar usar o dropna e o sample os indices ficam bagunçados, dando reset_index reordena os indices
+        self.df_anon.reset_index(drop=True, inplace=True)
+
+        print(f"Pré-processamento concluído. Registros finais para uso: {len(self.df_anon)}")
+
+        #Retorna o dataset tratado
+        return self.df_anon
+
+    #Normalizar os dados para o knn.
+    def _get_normalized_data(self):
+
+        # 1. Prepara os dados para o scaler.
+        # Cria uma copia para auxiliar e não mexer no data set
+        data_to_scale = self.df_anon[['idadeCaso', 'dataNascimento']].copy()
+
+        # Converter Data para numero
+        data_to_scale['dataNascimento'] = data_to_scale['dataNascimento'].astype('int64')
+
+        #Normalizando
+        scaler = MinMaxScaler()
+        scaled_matrix = scaler.fit_transform(data_to_scale)
+
+        # Converte a matriz NumPy de volta para um DataFrame do Pandas.
+        df_norm = pd.DataFrame(scaled_matrix, columns=['age_norm', 'date_norm'])
+
+        #Retorna o DataFrame normalizado.
+        return df_norm
+
+    #Algoritmo k-NN para criar os grupos.
+    def create_clusters_knn(self, k: int):
+        """
+        Agrupa todos os registros em "clusters" (grupos) de tamanho 'k' ou mais.
+        Ele faz isso pegando um registro, encontrando seus 'k-1' vizinhos
+        mais próximos e colocando todos no mesmo grupo.
+        """
+        print(f"Agrupamento k-NN para k={k}...")
+
+        # 'df_calc': Pega o DataFrame normalizado do método anterior.
+        df_calc = self._get_normalized_data()
+
+        # Cria index hash para facilitar a exclusão após agrupar
+        available_indices = set(df_calc.index)
+
+        # A lista que irá armazenar todos os grupos
+        clusters = []
+
+        # Troca o dataframe por uma matriz numpy para agilizar os calculos
+        data_matrix = df_calc.values
+
+        # Uma lista que mapeia a posição na matriz NumPy
+        index_map = list(df_calc.index)
+
+        # Realiza o agrupamento até o ultimo grupo de tamanho k
+        while len(available_indices) >= k:
+
+            #Pega o primeiro indice que achar dentro do available_indices
+            pivot_idx_original = next(iter(available_indices))
+
+            #Encontra a posição dentro da matriz
+            pivot_pos = index_map.index(pivot_idx_original)
+
+            # Pega as coordenadas de idade e data normalizadas do pivô.
+            pivot_coords = data_matrix[pivot_pos]
+
+            #Calula a distância Euclidiana para toda a matriz
+            dists = np.sqrt(((data_matrix - pivot_coords) ** 2).sum(axis=1))
+
+            # Uma lista temporária para guardar os vizinhos.
+            candidates = []
+
+            #Realiza a iteração sobre todas as distancias
+            for pos, dist in enumerate(dists):
+
+                #Converte a posição da matriz de volta para o indice do data frame
+                idx_orig = index_map[pos]
+
+                #Faz a verificação se o vizinho já está na lista dos indices disponiveis,
+                #Caso estiver adiciona a lista para agrupar
+                if idx_orig in available_indices:
+                    candidates.append((dist, idx_orig))
+
+            #Ordena a lista de vizinhos atraves da distancia, os mais proximos ficam no topo
+            candidates.sort(key=lambda x: x[0])
+
+            # Seleciona os k vizinhos mais próximos
+            best_k = candidates[:k]
+
+            #Extrai apenas os índices dos k melhores vizinhos.
+            group_indices = [c[1] for c in best_k]
+
+            #Adiciona o grupo a lista de agrupamentos
+            clusters.append(group_indices)
+
+
+            #Exluí os indices que já foram usados
+            for idx in group_indices:
+                available_indices.remove(idx)
+
+        #O If é execcutado após o while terminar, ele cuida das linhas que sobraram.
+        if available_indices:
+            #Se o dataset inteiro tiver menos que k linhas cria apenas um agrupamento
+            if not clusters:
+                clusters.append(list(available_indices))
+
+            else:
+                #Se não pega o ultimo agrupamento e adiciona as sobras a ele
+                clusters[-1].extend(list(available_indices))
+
+        print(f"Agrupamento concluído. Total de clusters: {len(clusters)}")
+
+        # Retorna a lista de grupos
+        return clusters
+
+
+    # Método para aplicar a generalização nos grupos.
+    def apply_k_anonymity(self, clusters):
+        """
+        Recebe os 'clusters' (listas de índices) e o DataFrame original.
+        Para cada cluster, ele olha os valores de idade e data e os
+        generaliza para que sejam IDÊNTICOS para todo o grupo.
+
+        Retorna: 'df_k_anonymized' (um novo DataFrame com os valores
+                 de idade/data generalizados).
+        """
+        print("Aplicando generalização (k-anonimato)...")
+
+        #Uma lista vazia que vai guardar as novas linhas antes de virarem um dataframe
+        anonymized_rows = []
+
+        # O for irá fazer uma iteração sobre cada grupo de índices
+        for cluster_indices in clusters:
+
+            # Pega as linhas de dados (subset) que correspondem aos índices deste grupo
+            subset = self.df_anon.loc[cluster_indices]
+
+            # --- 1. Generalização de IDADE ---
+
+            # Guarda todas as idades deste grupo.
+            ages = subset['idadeCaso']
+
+            #verifica se todas as idades no grupo são iguais
+            if ages.min() == ages.max():
+                #Se forem iguais apenas converte o número para string
+                age_gen = str(int(ages.min()))
+
+            #Se no grupo as idades forem diferentes faz a criação de um intevalo usando o mínimo e o máximo
+            else:
+                age_gen = f"[{int(ages.min())}-{int(ages.max())}]"
+
+            # --- 2. Generalização de DATA ---
+
+            # Guarda todas as datas deste grupo.
+            dates = subset['dataNascimento']
+
+
+            # Verifica se as datas deste grupo são iguais
+            if dates.nunique() == 1:
+                # Formata a data como "AAAA-MM-DD".
+                date_gen = dates.iloc[0].strftime('%Y-%m-%d')
+
+            #Verifica se todas as datas caem no mesmo mês e ano no grup
+            elif dates.dt.to_period('M').nunique() == 1:
+                #Generaliza, mantendo apenas o mês/ano
+                date_gen = dates.iloc[0].strftime('%m/%Y')
+
+
+            #Verifica se todas as datas do grupo caem no mesmo ano
+            elif dates.dt.to_period('Y').nunique() == 1:
+                # Generaliza, mantendo apenas o ano
+                date_gen = dates.iloc[0].strftime('%Y')
+
+            else:
+                # Cria um intervalo de anos).
+                min_y = dates.dt.year.min()
+                max_y = dates.dt.year.max()
+                date_gen = f"{min_y}-{max_y}"
+
+            # --- 3. Construção das linhas anonimizadas ---
+
+
+            #Faz a iteração sobre cada indice original do grupo
+            for idx in cluster_indices:
+
+                #Pega a linha original para recuperar a raca
+                original_row = self.df_anon.loc[idx]
+
+                #Cria um dicionario, com os valores generalizados e raca e cor original
+                anonymized_rows.append({
+                    'idadeCaso': age_gen,           # Valor generalizado
+                    'dataNascimento': date_gen,     # Valor generalizado
+                    'racaCor': original_row['racaCor'] # Valor original
+                })
+
+        #Transforma anonymized em dataframe, onde ele guarda as linhas já anonimizadas
+        df_k_anonymized = pd.DataFrame(anonymized_rows)
+
+        print(f"Generalização concluída. Dataset anonimizado gerado com {len(df_k_anonymized)} linhas.")
+
+        #Retorna o DataFrame k-anonimizado.
+        return df_k_anonymized
+
+
+    # Método para aplicar a l-Diversidade.
+    def apply_l_diversity(self, df_k_anon: pd.DataFrame, l_val: int):
+        """
+        Recebe o DataFrame k-anonimizado e o valor 'l'.
+        Ele garante que, para cada classe de equivalência (grupo),
+        existam pelo menos 'l' valores distintos para 'racaCor'.
+
+        Retorna: 'df_l_div' (o DataFrame final, agora k-anônimo E l-diverso).
+        """
+        print(f"\nAplicando l-diversidade para l={l_val}...")
+
+        #Valores para raças
+        VALID_RACES = ["Branca", "Preta","Amarela", "Parda", "Indígena", "Asiática"]
+
+        # Cria uma copia do Dataframe com anonimização para modificar sem
+        df_l_div = df_k_anon.copy()
+
+        #Realiza uma agrupamento pelas colunas generalizadas
+        groups = df_l_div.groupby(['idadeCaso', 'dataNascimento'])
+
+        #Faz um loop sobre cada classe equivalencia que está no groups
+        for name, group_df in groups:
+
+            #Pega os índices das linhas deste grupo.
+            group_indices = group_df.index
+
+            #Pega todas as raças que fazem parte do grupo de indices
+            current_races = df_l_div.loc[group_indices, 'racaCor']
+
+            #Cria um filtro para mostrar apenas as raças que existe na lista de raças
+            valid_races_in_group = current_races[current_races.isin(VALID_RACES)]
+
+            #Verifica as raças unicas
+            distinct_set = set(valid_races_in_group)
+
+            #Conta a quantidade de raças distintas
+            num_distinct = len(distinct_set)
+
+            #Verificar se o grupo satisfaz a l-diversidade
+            if num_distinct >= l_val:
+
+                #Realiza a busca por valores sem sentido
+                invalid_mask = ~current_races.isin(VALID_RACES)
+
+
+                #Realiza um loop que irá trocar os valores sem sentido exemplo "Ignorado" por uma valor existente na lista de raças
+                for idx in group_indices[invalid_mask]:
+
+                    #Realiza a substituição do valor sem sentido para um valor na lista de raças
+                    df_l_div.loc[idx, 'racaCor'] = random.choice(list(distinct_set))
+
+                continue
+
+            #Verificar quantas raças novas precisa, atraves l_val pedido e a quantidade de distintos no grupo
+            needed = l_val - num_distinct
+
+            #A lista de raças menos as raças que já tem no grupo
+            available_new_races = list(set(VALID_RACES) - distinct_set)
+
+            #Embaralha a lista
+            random.shuffle(available_new_races)
+
+
+            #Pega o numeros de raças que precisa que está no needed
+            races_to_add = available_new_races[:needed]
+
+            # Prioridade 2: 'is_duplicate' (ex: a 2ª, 3ª, 4ª "Parda" do grupo)
+            #Encontra as variaveis invalidas para serem candidatas a substituição
+            is_invalid = ~current_races.isin(VALID_RACES)
+            #Encontra as variaveis duplicatas para serem candidadas a substituição
+            is_duplicate = current_races.duplicated()
+
+            # Combina as duas variaveis
+            replaceable_mask = is_invalid | is_duplicate
+
+            # Cria uma lista de índices que podem ser sobrescritos.
+            replaceable_indices = list(group_indices[replaceable_mask])
+
+            #Verifica se a quantidade de linhas candidatas é menor que a quantidade de raças que precisa adicionar
+            if len(replaceable_indices) < needed:
+
+                #Pegar os itens que não fazem parte de replaceable_mask, ou seja não são candidatas a serem trocadas
+                other_indices = list(group_indices[~replaceable_mask])
+                #Embaralha para a escolha ser aleatoria
+                random.shuffle(other_indices)
+                # Adiciona a lista de candidatos
+                replaceable_indices.extend(other_indices)
+
+            # Se não houver linhas para substituir
+            if not replaceable_indices:
+                print(f"Aviso: Grupo {name} não tem linhas substituíveis. Impossível garantir l={l_val}.")
+                continue
+
+
+            # Se não houver raças novas para adicionar
+            if not races_to_add:
+                print(f"Aviso: Grupo {name} (r={distinct_set}) não tem raças novas disponíveis. Máximo de {len(VALID_RACES)} atingido.")
+                continue
+
+
+            #Iteração para adicionar as novas raças
+            for i in range(needed):
+
+                # Pega o índice da linha a ser mudada.
+                row_idx_to_change = replaceable_indices[i]
+                #Pega a raça nova a ser inserida.
+                new_race = races_to_add[i]
+
+                #Troca o valor aantigo pelo novo valor de raça
+                df_l_div.loc[row_idx_to_change, 'racaCor'] = new_race
+
+            #Faz um filtro pegando apenas as linhas do grupo atual
+            final_races = df_l_div.loc[group_indices, 'racaCor']
+            #Essa variavel guarda toda raça que não é valida
+            final_invalid_mask = ~final_races.isin(VALID_RACES)
+
+            #Guarda o conjunto de raças validas
+            final_valid_set = list(set(final_races[~final_invalid_mask]))
+
+            #Se final_valid_set estiver vazio é por conta de valores invalidos, ele irá receber a lista de raças
+            if not final_valid_set: final_valid_set = VALID_RACES
+
+            #Busca de ignorados
+            for idx in group_indices[final_invalid_mask]:
+                # Substitui por uma raça aleatória do novo
+                df_l_div.loc[idx, 'racaCor'] = random.choice(final_valid_set)
+
+        print("Aplicação de l-diversidade concluída.")
+
+        return df_l_div
+
+    # Método para calcular a métrica de precisão (perda de informação).
+    def calculate_precision(self, generalized_df: pd.DataFrame) -> float:
+        """
+        Calcula a Perda de Informação (ILoss) e retorna a Precisão (1 - ILoss).
+        Compara os valores generalizados (ex: "[20-29]") com o domínio
+        original (ex: 85 idades únicas) para medir quanta informação foi perdida.
+
+        Retorna: 'precision' (um float, ex: 0.9875). 1.0 é perfeito (sem perda).
+        """
+
+        #Colunas que foram generalizadas
+        attributes = ['idadeCaso', 'dataNascimento']
+
+        #Variavel para acumular as perdas
+        total_information_loss = 0.0
+
+        # O número total de linhas que estamos processando.
+        num_records = len(self.df_anon)
+
+        # Verificação de segurança para evitar divisão por zero.
+        if num_records == 0:
+            return 0.0
+
+        # O número de colunas que está sendo medido
+        num_attributes = len(attributes)
+
+        #Calcular precisão para as colunas
+        for attr_name in attributes:
+            hgv_size = 0
+            if attr_name == 'idadeCaso':
+                # Para IDADE, o domínio é o número de idades únicas (Correto)
+                hgv_size = self.df_anon[attr_name].dropna().nunique()
+
+            elif attr_name == 'dataNascimento':
+                # Para DATA, o domínio é o *intervalo* total de dias
+
+                # Pega a data mínima e máxima do dataset *original* (self.df_anon)
+                min_date = self.df_anon[attr_name].min()
+                max_date = self.df_anon[attr_name].max()
+
+                # Calcula a diferença em dias e adiciona 1
+                hgv_size = (max_date - min_date).days + 1
+
+            # 'if hgv_size <= 1': Verificação de segurança. Se só havia 1 valor
+            # único, a perda é impossível (é 0). Pula para o próximo atributo.7
+            #Verifica se só existe um valor unico
+            if hgv_size <= 1:
+                continue
+
+            #Faz a iteração sobre cada linha da coluna generalizada
+            for value in generalized_df[attr_name]:
+
+                #A variavel contem o numero de valores que estão escondidos e sendo 1 o seu valor minimo
+                #Para os casos onde a data é dia/mês/ano
+                h = 1.0
+
+                #Só entra se o valor não for null
+                if pd.notna(value):
+
+                    # Lógica de perda para Idade.
+                    if attr_name == 'idadeCaso':
+                        value_str = str(value)
+
+                        #Checa se é um intervalo
+                        if value_str.startswith('[') and '-' in value_str:
+                            try:
+                                # Extrai os números do intervalo.
+                                parts = value_str.strip('[]').split('-')
+                                # h recebe a perda é do tamanho do intervalo.
+                                h = float(parts[1]) - float(parts[0]) + 1
+                            except (ValueError, IndexError):
+                                h = 1.0
+
+                    #Lógica de perda para Data.
+                    elif attr_name == 'dataNascimento':
+                        value_str = str(value)
+
+                        #verifica se o valor tem apenas 4 digitos e se é constituido por apenas numeros
+                        if len(value_str) == 4 and value_str.isdigit():
+                            year = int(value_str)
+                            # h é a perda do número de dias naquele ano
+                            h = 366 if calendar.isleap(year) else 365
+
+                        #Verifica se tem 9 caracteres e se existe um traço separando os anos
+                        elif len(value_str) == 9 and '-' in value_str:
+                            try:
+                                #Quebra a string e separa o min e o max dela
+                                y_min, y_max = map(int, value_str.split('-'))
+                                h = 0
+                                #Realiza a contagem dos dias no intervalo y_min y_max
+                                for y in range(y_min, y_max + 1):
+                                  #Guarda o total de dias no intervalo
+                                    h += 366 if calendar.isleap(y) else 365
+                            except ValueError:
+                                h = hgv_size
+
+                        #Verifica se tem 7 caracteres e se existe uma barra
+                        elif len(value_str) == 7 and '/' in value_str:
+                            try:
+                              #Separa entre mês e ano
+                                month, year = map(int, value_str.split('/'))
+                                #A perda é o número de dias naquele mês
+                                h = calendar.monthrange(year, month)[1]
+                            except ValueError:
+                                h = 1.0
+                #Calcula a perda
+                total_information_loss += (h / hgv_size)
+
+        # Evitar divisão por zero.
+        if (num_records * num_attributes) == 0:
+            return 0.0
+
+        #Calcula a perda média por célula, é a perda total dividida pelo número total de células
+        average_loss = total_information_loss / (num_records * num_attributes)
+
+        # Inverte a perda para obter a precisão.
+        precision = 1 - average_loss
+
+        # Retorna o valor final da métrica.
+        return precision
+
+
+    # Método final para gerar os relatórios (métricas e gráficos).
+    def generate_metrics_and_plots(self, df_final: pd.DataFrame, k: int, l: int):
+        """
+        Calcula as métricas finais (Precisão, Tamanho Médio) e gera os
+        dois histogramas exigidos pelo trabalho (tamanho das classes k
+        e diversidade das classes l). Salva os gráficos como .png.
+        """
+        print("\n--- Métricas Finais ---")
+
+        #Chama o metodo para calcular a precisão
+        precision_score = self.calculate_precision(df_final)
+        print(f"Precisão (1 - Perda de Informação): {precision_score:.4f}")
+
+        #Re-agrupa o DataFrame final para encontrar as classes de equivalência.
+        eq_classes = df_final.groupby(['idadeCaso', 'dataNascimento'])
+
+        #O número total de grupos distintos.
+        num_classes = len(eq_classes)
+        print(f"Total de Classes de Equivalência: {num_classes}")
+
+        #Verificar se num_classes não é 0
+        if num_classes > 0:
+            # Calculo do tamanho médio de uma classe
+            avg_size = len(df_final) / num_classes
+            print(f"Tamanho Médio das Classes: {avg_size:.2f}")
+
+        ##Histograma de Tamanhos
+        #Cria uma lista contendo o tamanho de cada classe
+        class_sizes = eq_classes.size()
+
+
+        plt.figure(figsize=(10, 6))
+        bins = range(k, class_sizes.max() + 2)
+        plt.hist(class_sizes, bins=bins, align='left', edgecolor='black')
+        plt.title(f'Histograma: Tamanho das Classes de Equivalência (k={k})')
+        plt.xlabel('Tamanho da Classe (>= k)')
+        plt.ylabel('Frequência (Nº de Classes)')
+        plt.xticks(range(k, class_sizes.max() + 1, max(1, (class_sizes.max() - k + 1)//15)))
+
+        #Nome do arquivo de saída.
+        plot_filename_k = rf'data\hist_k_anon_k{k}.png'
+
+        #Salva o gráfico como um arquivo .png.
+        plt.savefig(plot_filename_k)
+        print(f"Gráfico de k-anonimato salvo em: {plot_filename_k}")
+        plt.close()
+
+        ##Histograma de Diversidade
+
+        #Guarda uma lista contando a contagem de raças unicas de cada classe
+        class_diversity = eq_classes['racaCor'].nunique()
+
+
+        plt.figure(figsize=(10, 6))
+        diversity_counts = class_diversity.value_counts().sort_index()
+        plt.bar(diversity_counts.index, diversity_counts.values, edgecolor='black', width=0.8)
+        plt.title(f'Histograma: Diversidade de Raça (k={k}, l={l})')
+        plt.xlabel('Nº de Raças Distintas por Classe')
+        plt.ylabel('Frequência (Nº de Classes)')
+        plt.xticks(range(min(l, diversity_counts.index.min()), diversity_counts.index.max() + 2))
+
+        #Nome do arquivo de saída.
+        plot_filename_l = rf'data\hist_l_div_k{k}_l{l}.png'
+
+        #Salva o segundo gráfico.
+        plt.savefig(plot_filename_l)
+        print(f"Gráfico de l-diversidade salvo em: {plot_filename_l}")
+        plt.close()
+
+
+
+
+def main():
+    print("##### Início do Processo de Anonimização #####")
+
+    # Parâmetros do Trabalho
+    k_values = [4]
+    l_values = [3]
+    #diminuir o tamanho do dataset
+    SAMPLE_SIZE = 0.01
+
+    try:
+        df_raw = pd.read_csv('dados_covid-ce_trab02.csv', encoding='latin-1', low_memory=False)
+    except FileNotFoundError:
+        print("Erro: Arquivo 'dados_covid-ce_trab02.csv' não encontrado.")
+        return
+    except Exception as e:
+        print(f"Erro ao ler CSV: {e}")
+        return
+
+    # Garante que a pasta /data exista (onde os CSVs e PNGs serão salvos)
+    os.makedirs('data', exist_ok=True)
+
+    # 1. Instancia e Prepara os dados UMA VEZ
+    anon = Anonymizer(df_raw)
+    print(f"Processando com {SAMPLE_SIZE*100}% dos dados...")
+    anon.preprocess_data(sample_frac=SAMPLE_SIZE)
+
+    if anon.df_anon is None or anon.df_anon.empty:
+        print("Pré-processamento falhou ou resultou em dados vazios.")
+        return
+
+    # Guarda os clusters de cada K para não recalcular
+    # Nota: A geração do histograma K foi movida para dentro do loop de L
+    # para garantir que ele seja gerado para cada k/l
+
+    # 2. Loop principal
+    for k in k_values:
+        print(f"\n#################################################")
+        print(f"### Processando para K = {k}")
+        print(f"#################################################")
+
+        # 2.1. k-Anonimato
+        # Gera os clusters e o dataframe k-anonimizado
+        clusters = anon.create_clusters_knn(k)
+        df_k_anon = anon.apply_k_anonymity(clusters)
+
+        # 2.2. Loop de l-Diversidade
+        for l in l_values:
+            # Regra: l deve ser <= k
+            if l > k:
+                print(f"\n--- Pulando (k={k}, l={l}) pois l > k.")
+                continue
+
+            print(f"\n--- Aplicando L = {l} (para K = {k}) ---")
+
+            # Aplica l-diversidade (partindo do df_k_anon limpo)
+            df_final = anon.apply_l_diversity(df_k_anon.copy(), l)
+
+            # Salva o arquivo CSV
+            output_filename = rf'data\dados covid {k} {l}.csv'
+            try:
+                df_final.to_csv(output_filename, index=False, encoding='utf-8')
+                print(f"\nArquivo salvo com sucesso em: {output_filename}")
+            except Exception as e:
+                print(f"Erro ao salvar CSV '{output_filename}': {e}")
+
+            # Gera Métricas e Plots
+            anon.generate_metrics_and_plots(df_final, k, l)
+
+    print("\n##### Processo de Anonimização Concluído #####")
+
+
+if __name__ == "__main__":
+    main()
